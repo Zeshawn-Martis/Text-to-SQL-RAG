@@ -8,3 +8,4 @@ chromadb==0.5.0
 pandas==2.2.2
 sentence-transformers
 python-dotenv
+tabulate
