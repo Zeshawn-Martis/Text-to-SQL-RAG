@@ -1,34 +1,30 @@
-# Agentic Text-to-SQL Copilot
+# 🧠 Agentic Text-to-SQL Copilot
 
-A simple AI-powered app that converts natural language questions into SQL queries and runs them on a movie database.
+An AI-powered application that converts natural language questions into SQL queries and executes them on a database.
 
-## Built With
-
-- Streamlit
-- Gemini
-- ChromaDB
-- SQLite
-- LangChain
+Built using **Gemini, LangChain, ChromaDB, Sentence Transformers, SQLite, and Streamlit**.
 
 ## Features
 
-- Ask questions in plain English.
-- Automatically generates and executes SQL.
-- Uses retrieval (RAG) to improve query generation.
-- Attempts to fix SQL errors automatically.
-- Shows the generated SQL and query results.
+- Ask database questions using plain English
+- Automatically generates and executes SQL queries
+- Uses RAG with ChromaDB to retrieve previous SQL examples
+- Self-corrects SQL errors using Gemini
+- Displays generated SQL and query results
+
+## Tech Stack
+
+- **LLM:** Google Gemini
+- **Framework:** LangChain
+- **Vector Database:** ChromaDB
+- **Embeddings:** Sentence Transformers
+- **Database:** SQLite
+- **Frontend:** Streamlit
 
 ## Running Locally
 
+### 1. Clone the repository
+
 ```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-Create a `.env` file with:
-
-```env
-GOOGLE_API_KEY=your_api_key_here
-```
-
----
+git clone https://github.com/Zeshawn-Martis/Text-to-SQL-RAG.git
+cd Text-to-SQL-RAG
