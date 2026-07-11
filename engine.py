@@ -1,126 +1,446 @@
-import os
 import sqlite3
 import uuid
 import pandas as pd
 import chromadb
+import streamlit as st
+
 from dotenv import load_dotenv
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
+from chromadb.utils.embedding_functions import (
+    SentenceTransformerEmbeddingFunction
+)
+
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+
+from langchain_core.prompts import (
+    ChatPromptTemplate
+)
+
+from langchain_core.output_parsers import (
+    StrOutputParser
+)
+
+
 
 # ENVIRONMENT
-load_dotenv()
-DB_PATH = "movies.db"
 
-# SQLITE DATABASE
-def setup_database():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.executescript("""
-        CREATE TABLE IF NOT EXISTS directors(id INTEGER PRIMARY KEY, name TEXT);
-        CREATE TABLE IF NOT EXISTS movies(
-            id INTEGER PRIMARY KEY, 
-            title TEXT, 
-            genre TEXT, 
-            rating REAL, 
-            director_id INTEGER, 
-            FOREIGN KEY(director_id) REFERENCES directors(id)
-        );
-    """)
-    if cursor.execute("SELECT COUNT(*) FROM directors").fetchone()[0] == 0:
-        cursor.executemany("INSERT INTO directors VALUES (?,?)", [
-            (1, "Christopher Nolan"), (2, "Denis Villeneuve"), (3, "Greta Gerwig")
-        ])
-        cursor.executemany("INSERT INTO movies (title,genre,rating,director_id) VALUES (?,?,?,?)", [
-            ("Inception", "Sci-Fi", 8.8, 1), ("Interstellar", "Sci-Fi", 8.6, 1),
-            ("Dune", "Sci-Fi", 8.0, 2), ("Arrival", "Sci-Fi", 7.9, 2),
-            ("Barbie", "Comedy", 7.0, 3), ("Little Women", "Drama", 7.8, 3)
-        ])
-    conn.commit()
-    conn.close()
+load_dotenv()
+
+DB_PATH = "database/movies.db"
+
+
+
+# DATABASE QUERY
 
 def run_query(sql):
+
     conn = sqlite3.connect(DB_PATH)
+
+    conn.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
     try:
-        result = pd.read_sql_query(sql, conn)
+
+        result = pd.read_sql_query(
+            sql,
+            conn
+        )
+
         conn.close()
+
         return result
+
+
     except Exception as e:
+
         conn.close()
+
         return f"Database Error: {e}"
 
-# CHROMADB + EMBEDDINGS
-embedding_function = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-chroma_client = chromadb.PersistentClient(path="./chroma_rag_cache")
-memory_db = chroma_client.get_or_create_collection(name="sql_memory", embedding_function=embedding_function)
+
+
+# FETCH DATABASE SCHEMA
+
+def get_database_schema():
+
+    conn = sqlite3.connect(DB_PATH)
+
+    cursor = conn.cursor()
+
+
+    cursor.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type='table'
+        """
+    )
+
+
+    tables = cursor.fetchall()
+
+    conn.close()
+
+
+    return "\n\n".join(
+        x[0]
+        for x in tables
+        if x[0]
+    )
+
+
+
+# CHROMADB
+
+@st.cache_resource
+def load_embedding():
+
+    return SentenceTransformerEmbeddingFunction(
+        model_name="all-MiniLM-L6-v2"
+    )
+
+
+
+@st.cache_resource
+def load_chroma():
+
+    client = chromadb.PersistentClient(
+        path="./chroma_rag_cache"
+    )
+
+
+    return client.get_or_create_collection(
+        name="sql_memory",
+        embedding_function=load_embedding()
+    )
+
+
+
+def get_memory_db():
+
+    return load_chroma()
+
+
 
 # GEMINI
-llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0, max_retries=0)
 
-# PROMPTS
-sql_prompt = ChatPromptTemplate.from_template("""
-You are a SQL expert. Database schema: directors(id, name), movies(id, title, genre, rating, director_id).
-Rules: 1. Generate ONLY SQLite SQL. 2. Put SQL inside <sql></sql>. 3. No markdown. 4. Use examples if relevant.
-Question: {question}
-Previous examples: {examples}
-""")
+@st.cache_resource
+def load_llm():
 
-fix_prompt = ChatPromptTemplate.from_template("""
-You are a SQL debugging expert. The SQL failed with: {error}
-Question: {question}
-Return ONLY corrected SQLite SQL inside <sql></sql>.
-""")
+    return ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash-lite",
+        temperature=0,
+        max_retries=0
+    )
 
-answer_prompt = ChatPromptTemplate.from_template("Explain the result to the user. Question: {question}\nResult: {data}")
 
-# CHAINS
-sql_chain = sql_prompt | llm | StrOutputParser()
-fix_chain = fix_prompt | llm | StrOutputParser()
-answer_chain = answer_prompt | llm | StrOutputParser()
 
-# HELPERS
+llm = load_llm()
+
+
+
+# SAFE GEMINI CALL
+
+def safe_invoke(chain, inputs):
+
+    try:
+
+        return chain.invoke(inputs)
+
+
+    except Exception as e:
+
+        error = str(e).lower()
+
+
+        if any(
+            x in error
+            for x in [
+                "429",
+                "quota",
+                "resourceexhausted",
+                "rate limit"
+            ]
+        ):
+
+            raise RuntimeError(
+                "Gemini quota exceeded."
+            )
+
+
+        raise RuntimeError(
+            f"Gemini error: {e}"
+        )
+
+
+
+# SQL GENERATION PROMPT
+
+sql_prompt = ChatGoogleGenerativeAI
+
+
+sql_prompt = ChatPromptTemplate.from_template(
+"""
+
+You are a SQL expert.
+
+Database schema:
+
+{schema}
+
+
+Rules:
+
+1. Generate only SQLite SQL.
+2. Put SQL inside <sql></sql>.
+3. No markdown.
+4. Only use existing columns.
+5. Use joins when required.
+
+
+Question:
+
+{question}
+
+
+Previous examples:
+
+{examples}
+
+"""
+)
+
+
+
+# SQL FIX PROMPT
+
+fix_prompt = ChatPromptTemplate.from_template(
+"""
+
+You are a SQL debugging expert.
+
+Database schema:
+
+{schema}
+
+
+SQL error:
+
+{error}
+
+
+Question:
+
+{question}
+
+
+Return only corrected SQLite SQL.
+
+Use:
+
+<sql>
+query
+</sql>
+
+"""
+)
+
+
+
+sql_chain = (
+    sql_prompt
+    | llm
+    | StrOutputParser()
+)
+
+
+
+fix_chain = (
+    fix_prompt
+    | llm
+    | StrOutputParser()
+)
+
+
+
+# EXTRACT SQL
+
 def extract_sql(text):
-    if "<sql>" in text and "</sql>" in text:
-        return text.split("<sql>")[1].split("</sql>")[0].strip()
-    return text.replace("```sql", "").replace("```", "").strip()
 
-def extract_thinking(text):
-    return text.split("<thinking>")[1].split("</thinking>")[0] if "<thinking>" in text else "No reasoning"
+    if "<sql>" in text:
 
-# RAG AGENT
-def run_agentic_pipeline(user_question):
-    examples, final_sql, thinking, corrected = "", "", "", False
-    
-    # Retrieval
+        return (
+            text
+            .split("<sql>")[1]
+            .split("</sql>")[0]
+            .strip()
+        )
+
+
+    return (
+        text
+        .replace("```sql","")
+        .replace("```","")
+        .strip()
+    )
+
+
+
+# MAIN PIPELINE
+
+def run_agentic_pipeline(question):
+
+
+    memory_db = get_memory_db()
+
+
+    examples = ""
+
+    corrected = False
+
+
+
+    # RETRIEVE OLD SQL EXAMPLES
+
     if memory_db.count() > 0:
-        retrieved = memory_db.query(query_texts=[user_question], n_results=3)
-        if retrieved["documents"][0]:
-            examples = "\n\n".join(retrieved["documents"][0])
 
-    # Generation & Execution
-    response = sql_chain.invoke({"question": user_question, "examples": examples})
-    final_sql, thinking = extract_sql(response), extract_thinking(response)
-    db_result = run_query(final_sql)
+        result = memory_db.query(
+            query_texts=[question],
+            n_results=1
+        )
 
-    # Self-Healing
-    if isinstance(db_result, str) and "Database Error" in db_result:
-        final_sql = extract_sql(fix_chain.invoke({"error": db_result, "question": user_question}))
-        db_result = run_query(final_sql)
+
+        if result["documents"][0]:
+
+            examples = (
+                result["documents"][0][0]
+            )
+
+
+
+    schema = get_database_schema()
+
+
+
+    # GENERATE SQL
+
+    response = safe_invoke(
+        sql_chain,
+        {
+            "question": question,
+            "schema": schema,
+            "examples": examples
+        }
+    )
+
+
+    sql = extract_sql(response)
+
+
+
+    # EXECUTE SQL
+
+    db_result = run_query(sql)
+
+
+
+    # SELF HEALING
+
+    if (
+        isinstance(db_result,str)
+        and
+        "Database Error" in db_result
+    ):
+
+
         corrected = True
 
-    # Memory Update
-    if not isinstance(db_result, str):
-        memory_db.add(documents=[f"Question: {user_question}\nSQL: {final_sql}"], 
-                      metadatas=[{"sql": final_sql}], ids=[str(uuid.uuid4())])
+
+        fixed = safe_invoke(
+            fix_chain,
+            {
+                "error": db_result,
+                "question": question,
+                "schema": schema
+            }
+        )
+
+
+        sql = extract_sql(
+            fixed
+        )
+
+
+        db_result = run_query(sql)
+
+
+
+    # SAVE MEMORY
+
+    if not isinstance(
+        db_result,
+        str
+    ):
+
+
+        memory_db.add(
+
+            documents=[
+
+                f"""
+Question:
+{question}
+
+SQL:
+{sql}
+"""
+            ],
+
+            metadatas=[
+
+                {
+                    "sql": sql
+                }
+
+            ],
+
+            ids=[
+
+                str(uuid.uuid4())
+
+            ]
+        )
+
+
+
+    # FINAL ANSWER
+
+    if isinstance(
+        db_result,
+        str
+    ):
+
+        answer = db_result
+
+
+    else:
+
+        answer = db_result.to_markdown(
+            index=False
+        )
+
 
     return {
-        "answer": answer_chain.invoke({"question": user_question, "data": db_result.to_string()}),
-        "sql": final_sql,
-        "thinking": thinking,
-        "retrieved_examples": examples,
-        "raw_data": db_result,
-        "was_corrected": corrected
-    }
 
-setup_database()
+        "answer": answer,
+
+        "sql": sql,
+
+        "retrieved_examples": examples,
+
+        "raw_data": db_result,
+
+        "was_corrected": corrected
+
+    }
